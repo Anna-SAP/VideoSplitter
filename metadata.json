@@ -1,0 +1,5 @@
+{
+  "name": "Video Splitter",
+  "description": "A fast, client-side web application to split long videos into shorter segments using FFmpeg.wasm.",
+  "requestFramePermissions": []
+}
