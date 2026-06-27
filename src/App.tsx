@@ -6,12 +6,13 @@ import { fetchFile } from '@ffmpeg/util';
 // Use Vite's ?url to get direct URLs to the assets
 import coreURL from '@ffmpeg/core?url';
 import wasmURL from '@ffmpeg/core/wasm?url';
-import workerURL from '@ffmpeg/ffmpeg/worker?url';
+import workerURL from '@ffmpeg/ffmpeg/worker?worker&url';
 
 export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [engineError, setEngineError] = useState<string | null>(null);
   const ffmpegRef = useRef(new FFmpeg());
   const messageRef = useRef<HTMLParagraphElement | null>(null);
 
@@ -31,12 +32,12 @@ export default function App() {
     if (loaded || isLoading) return;
     
     if (!ffmpegRef.current) {
-      setError("FFmpeg library failed to initialize.");
+      setEngineError("FFmpeg library failed to initialize.");
       return;
     }
 
     setIsLoading(true);
-    setError(null);
+    setEngineError(null);
     const ffmpeg = ffmpegRef.current;
     
     ffmpeg.on('log', ({ message }) => {
@@ -45,7 +46,7 @@ export default function App() {
     });
 
     ffmpeg.on('progress', ({ progress, time }) => {
-      setProgress(Math.round(progress * 100));
+      setProgress(Math.round(Math.max(0, Math.min(1, progress)) * 100));
     });
 
     try {
@@ -55,12 +56,12 @@ export default function App() {
           wasmURL,
           classWorkerURL: workerURL
         }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Engine load timeout (60s)')), 60000))
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Engine load timeout (120s)')), 120000))
       ]);
       setLoaded(true);
     } catch (err) {
       console.error("Failed to load FFmpeg:", err);
-      setError(`Failed to load video processing engine: ${err instanceof Error ? err.message : String(err)}. Please check your network or try again.`);
+      setEngineError(`Failed to load video processing engine: ${err instanceof Error ? err.message : String(err)}. Please check your network or try again.`);
     } finally {
       setIsLoading(false);
     }
@@ -69,7 +70,8 @@ export default function App() {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
       const file = e.target.files[0];
-      if (file.type.startsWith('video/')) {
+      const isVideo = file.type.startsWith('video/') || /\.(mp4|mov|avi|mkv|webm)$/i.test(file.name);
+      if (isVideo) {
         setVideoFile(file);
         setOutputFiles([]);
         setProgress(0);
@@ -103,7 +105,8 @@ export default function App() {
 
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const file = e.dataTransfer.files[0];
-      if (file.type.startsWith('video/')) {
+      const isVideo = file.type.startsWith('video/') || /\.(mp4|mov|avi|mkv|webm)$/i.test(file.name);
+      if (isVideo) {
         setVideoFile(file);
         setOutputFiles([]);
         setProgress(0);
@@ -123,12 +126,22 @@ export default function App() {
     setError(null);
 
     const ffmpeg = ffmpegRef.current;
-    const inputFileName = 'input_video' + videoFile.name.substring(videoFile.name.lastIndexOf('.'));
-    const extension = videoFile.name.substring(videoFile.name.lastIndexOf('.'));
+    const extensionIndex = videoFile.name.lastIndexOf('.');
+    const extension = extensionIndex !== -1 ? videoFile.name.substring(extensionIndex) : '.mp4';
     
     try {
-      // Write file to FFmpeg virtual file system
-      await ffmpeg.writeFile(inputFileName, await fetchFile(videoFile));
+      // Create a mount point and mount the file using WORKERFS
+      // This avoids loading the entire file into the browser's memory
+      const mountPoint = '/workfs';
+      await ffmpeg.createDir(mountPoint);
+      
+      // We use 'WORKERFS' to mount File objects directly
+      // Create a new File object with a safe name to prevent issues with spaces/special characters
+      const safeFileName = 'input_video' + extension;
+      const safeFile = new File([videoFile], safeFileName, { type: videoFile.type });
+      
+      await ffmpeg.mount('WORKERFS', { files: [safeFile] }, mountPoint);
+      const inputPath = `${mountPoint}/${safeFileName}`;
 
       // Calculate duration in seconds
       const durationInSeconds = (segmentMinutes * 60) + segmentSeconds;
@@ -139,19 +152,24 @@ export default function App() {
 
       // Run FFmpeg command to split
       // -c copy: stream copy, no re-encoding (very fast)
-      // -map 0: map all streams
+      // -map 0:v:0 -map 0:a?: map only first video and audio streams (ignore data/subtitles which break segmentation)
       // -segment_time: duration of each segment
       // -f segment: format is segment
-      // -reset_timestamps 1: reset timestamps at the beginning of each segment
-      await ffmpeg.exec([
-        '-i', inputFileName,
+      // -reset_timestamps 1: reset timestamps at the beginning of each segment so players show correct duration
+      const ret = await ffmpeg.exec([
+        '-i', inputPath,
         '-c', 'copy',
-        '-map', '0',
+        '-map', '0:v:0',
+        '-map', '0:a?',
         '-segment_time', durationInSeconds.toString(),
         '-f', 'segment',
         '-reset_timestamps', '1',
         `output_%03d${extension}`
       ]);
+
+      if (ret !== 0) {
+        throw new Error(`FFmpeg process exited with code ${ret}`);
+      }
 
       // Read output files
       const files = await ffmpeg.listDir('/');
@@ -168,17 +186,20 @@ export default function App() {
 
       // Sort files to ensure correct order
       generatedFiles.sort((a, b) => a.name.localeCompare(b.name));
+      
+      setProgress(100);
       setOutputFiles(generatedFiles);
 
-      // Clean up MEMFS
-      await ffmpeg.deleteFile(inputFileName);
+      // Clean up MEMFS and WORKERFS
+      await ffmpeg.unmount(mountPoint);
+      await ffmpeg.deleteDir(mountPoint);
       for (const file of generatedFiles) {
         await ffmpeg.deleteFile(file.name);
       }
 
     } catch (err) {
       console.error("Error splitting video:", err);
-      setError("An error occurred while splitting the video. The file might be corrupted or unsupported.");
+      setError(`An error occurred while splitting the video: ${err instanceof Error ? err.message : String(err)}. The file might be corrupted or unsupported.`);
     } finally {
       setIsProcessing(false);
     }
@@ -189,7 +210,9 @@ export default function App() {
       setTimeout(() => {
         const a = document.createElement('a');
         a.href = file.url;
-        a.download = `${videoFile?.name.replace(/\.[^/.]+$/, "")}_part${index + 1}${file.name.substring(file.name.lastIndexOf('.'))}`;
+        const extension = file.name.substring(file.name.lastIndexOf('.'));
+        const originalNameWithoutExt = videoFile?.name.replace(/\.[^/.]+$/, "");
+        a.download = `Part${index + 1}_${originalNameWithoutExt}${extension}`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -223,6 +246,21 @@ export default function App() {
             Cut your long videos into shorter segments for social media. Everything happens right in your browser—no uploads, no server limits, complete privacy.
           </p>
         </div>
+
+        {engineError && (
+          <div className="mb-8 p-4 bg-red-50 border border-red-200 rounded-xl flex items-start justify-between gap-3 text-red-800">
+            <div className="flex items-start gap-3">
+              <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
+              <p className="text-sm font-medium">{engineError}</p>
+            </div>
+            <button 
+              onClick={load}
+              className="px-3 py-1 bg-red-100 hover:bg-red-200 text-red-800 text-sm font-medium rounded-lg transition-colors shrink-0"
+            >
+              Retry
+            </button>
+          </div>
+        )}
 
         {error && (
           <div className="mb-8 p-4 bg-red-50 border border-red-200 rounded-xl flex items-start gap-3 text-red-800">
@@ -309,8 +347,8 @@ export default function App() {
               <h3 className="text-sm font-semibold text-zinc-900 uppercase tracking-wider mb-4">3. Process</h3>
               
               <button
-                onClick={(!loaded && error) ? load : splitVideo}
-                disabled={(!loaded && !error) || isProcessing || (!videoFile && loaded)}
+                onClick={(!loaded && engineError) ? load : splitVideo}
+                disabled={(!loaded && !engineError) || isProcessing || (!videoFile && loaded)}
                 className="w-full relative flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white py-3.5 px-6 rounded-xl font-medium transition-all disabled:opacity-70 disabled:cursor-not-allowed overflow-hidden group"
               >
                 {isProcessing ? (
@@ -320,7 +358,7 @@ export default function App() {
                     <span className="relative z-10">Processing... {progress}%</span>
                   </>
                 ) : !loaded ? (
-                  error ? (
+                  engineError ? (
                     <>
                       <AlertCircle className="w-5 h-5" />
                       <span>Retry Loading Engine</span>
@@ -376,7 +414,7 @@ export default function App() {
                       </div>
                       <a
                         href={file.url}
-                        download={`${videoFile?.name.replace(/\.[^/.]+$/, "")}_part${index + 1}${file.name.substring(file.name.lastIndexOf('.'))}`}
+                        download={`Part${index + 1}_${videoFile?.name.replace(/\.[^/.]+$/, "")}${file.name.substring(file.name.lastIndexOf('.'))}`}
                         className="p-2 text-zinc-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors shrink-0"
                         title="Download segment"
                       >
