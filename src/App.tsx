@@ -19,6 +19,8 @@ export default function App() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [segmentMinutes, setSegmentMinutes] = useState<number>(5);
   const [segmentSeconds, setSegmentSeconds] = useState<number>(0);
+  const [splitMode, setSplitMode] = useState<'duration' | 'size'>('duration');
+  const [segmentSizeMB, setSegmentSizeMB] = useState<number>(25);
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [outputFiles, setOutputFiles] = useState<{ name: string; url: string }[]>([]);
@@ -143,11 +145,51 @@ export default function App() {
       await ffmpeg.mount('WORKERFS', { files: [safeFile] }, mountPoint);
       const inputPath = `${mountPoint}/${safeFileName}`;
 
-      // Calculate duration in seconds
-      const durationInSeconds = (segmentMinutes * 60) + segmentSeconds;
+      let durationInSeconds = 0;
 
-      if (durationInSeconds <= 0) {
-        throw new Error("Segment duration must be greater than 0 seconds.");
+      if (splitMode === 'duration') {
+        durationInSeconds = (segmentMinutes * 60) + segmentSeconds;
+        if (durationInSeconds <= 0) {
+          throw new Error("Segment duration must be greater than 0 seconds.");
+        }
+      } else {
+        if (segmentSizeMB <= 0) {
+          throw new Error("Segment size must be greater than 0 MB.");
+        }
+
+        // To split by size, we estimate the duration based on file size and total video duration
+        await ffmpeg.ffprobe([
+          '-v', 'error',
+          '-show_entries', 'format=duration',
+          '-of', 'default=noprint_wrappers=1:nokey=1',
+          inputPath,
+          '-o', 'duration.txt'
+        ]);
+
+        const durationData = await ffmpeg.readFile('duration.txt');
+        const durationStr = new TextDecoder().decode(durationData as Uint8Array).trim();
+        const totalDuration = parseFloat(durationStr);
+
+        if (isNaN(totalDuration) || totalDuration <= 0) {
+          throw new Error("Could not determine video duration. The file might be corrupted.");
+        }
+
+        const totalSizeMB = videoFile.size / (1024 * 1024);
+        
+        // Calculate duration based on proportional size. 
+        // We multiply by 0.95 as a safety margin because variable bitrate can cause size fluctuations.
+        const safeSizeRatio = 0.95;
+        durationInSeconds = (segmentSizeMB * safeSizeRatio / totalSizeMB) * totalDuration;
+
+        // Ensure we have a valid duration
+        if (durationInSeconds > totalDuration) {
+           durationInSeconds = totalDuration;
+        }
+        if (durationInSeconds <= 0) {
+            durationInSeconds = 1;
+        }
+        
+        await ffmpeg.deleteFile('duration.txt');
       }
 
       // Run FFmpeg command to split
@@ -315,31 +357,59 @@ export default function App() {
 
             {/* Settings Card */}
             <div className={`bg-white rounded-2xl shadow-sm border border-zinc-200 p-6 transition-opacity ${!videoFile ? 'opacity-50 pointer-events-none' : 'opacity-100'}`}>
-              <h3 className="text-sm font-semibold text-zinc-900 uppercase tracking-wider mb-4">2. Segment Duration</h3>
+              <h3 className="text-sm font-semibold text-zinc-900 uppercase tracking-wider mb-4">2. Split Settings</h3>
               
-              <div className="flex items-center gap-6">
-                <div className="flex items-center gap-3">
-                  <input
-                    type="number"
-                    min="0"
-                    value={segmentMinutes}
-                    onChange={(e) => setSegmentMinutes(Math.max(0, Number(e.target.value)))}
-                    className="w-24 px-4 py-2.5 bg-zinc-50 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-zinc-900 font-medium text-center"
-                  />
-                  <span className="text-zinc-600 font-medium">Minutes</span>
-                </div>
-                <div className="flex items-center gap-3">
-                  <input
-                    type="number"
-                    min="0"
-                    max="59"
-                    value={segmentSeconds}
-                    onChange={(e) => setSegmentSeconds(Math.max(0, Math.min(59, Number(e.target.value))))}
-                    className="w-24 px-4 py-2.5 bg-zinc-50 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-zinc-900 font-medium text-center"
-                  />
-                  <span className="text-zinc-600 font-medium">Seconds</span>
-                </div>
+              <div className="flex gap-2 mb-6 p-1 bg-zinc-100 rounded-lg">
+                <button
+                  onClick={() => setSplitMode('duration')}
+                  className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-all ${splitMode === 'duration' ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500 hover:text-zinc-700'}`}
+                >
+                  By Duration
+                </button>
+                <button
+                  onClick={() => setSplitMode('size')}
+                  className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-all ${splitMode === 'size' ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500 hover:text-zinc-700'}`}
+                >
+                  By File Size
+                </button>
               </div>
+
+              {splitMode === 'duration' ? (
+                <div className="flex items-center gap-6">
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="number"
+                      min="0"
+                      value={segmentMinutes}
+                      onChange={(e) => setSegmentMinutes(Math.max(0, Number(e.target.value)))}
+                      className="w-24 px-4 py-2.5 bg-zinc-50 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-zinc-900 font-medium text-center"
+                    />
+                    <span className="text-zinc-600 font-medium">Minutes</span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="number"
+                      min="0"
+                      max="59"
+                      value={segmentSeconds}
+                      onChange={(e) => setSegmentSeconds(Math.max(0, Math.min(59, Number(e.target.value))))}
+                      className="w-24 px-4 py-2.5 bg-zinc-50 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-zinc-900 font-medium text-center"
+                    />
+                    <span className="text-zinc-600 font-medium">Seconds</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center gap-3">
+                  <input
+                    type="number"
+                    min="1"
+                    value={segmentSizeMB}
+                    onChange={(e) => setSegmentSizeMB(Math.max(1, Number(e.target.value)))}
+                    className="w-24 px-4 py-2.5 bg-zinc-50 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-zinc-900 font-medium text-center"
+                  />
+                  <span className="text-zinc-600 font-medium">MB per segment</span>
+                </div>
+              )}
             </div>
 
             {/* Action Card */}
